@@ -66,7 +66,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 - **Backend**: FastAPI (Python), managed as a `uv` project
 - **Database**: SQLite, single file at `db/finally.db`, volume-mounted for persistence
 - **Real-time data**: Server-Sent Events (SSE) — simpler than WebSockets, one-way server→client push, works everywhere
-- **AI integration**: LiteLLM → OpenRouter (Cerebras for fast inference), with structured outputs for trade execution
+- **AI integration**: OpenAI API (`gpt-4.1-mini`), with Structured Outputs for trade execution
 - **Market data**: Environment-variable driven — simulator by default, real data via Massive API if key provided
 
 ### Why These Choices
@@ -88,7 +88,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 finally/
 ├── frontend/                 # Next.js TypeScript project (static export)
 ├── backend/                  # FastAPI uv project (Python)
-│   └── db/                   # Schema definitions, seed data, migration logic
+│   └── db/                   # Schema definitions, seed data, lazy init logic
 ├── planning/                 # Project-wide documentation for agents
 │   ├── PLAN.md               # This document
 │   └── ...                   # Additional agent reference docs
@@ -121,8 +121,8 @@ finally/
 ## 5. Environment Variables
 
 ```bash
-# Required: OpenRouter API key for LLM chat functionality
-OPENROUTER_API_KEY=your-openrouter-api-key-here
+# Required: OpenAI API key for LLM chat functionality
+OPENAI_API_KEY=your-openai-api-key-here
 
 # Optional: Massive (Polygon.io) API key for real market data
 # If not set, the built-in market simulator is used (recommended for most users)
@@ -211,8 +211,8 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `ticker` TEXT
-- `quantity` REAL (fractional shares supported)
-- `avg_cost` REAL
+- `quantity` REAL (fractional shares supported, rounded to 6 decimal places)
+- `avg_cost` REAL — weighted average cost basis: on each buy, `avg_cost = (old_qty * old_avg_cost + buy_qty * buy_price) / (old_qty + buy_qty)`; unchanged on sells
 - `updated_at` TEXT (ISO timestamp)
 - UNIQUE constraint on `(user_id, ticker)`
 
@@ -221,8 +221,8 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `user_id` TEXT (default: `"default"`)
 - `ticker` TEXT
 - `side` TEXT (`"buy"` or `"sell"`)
-- `quantity` REAL (fractional shares supported)
-- `price` REAL
+- `quantity` REAL (fractional shares supported, rounded to 6 decimal places)
+- `price` REAL (rounded to 2 decimal places)
 - `executed_at` TEXT (ISO timestamp)
 
 **portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution.
@@ -270,6 +270,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 ### Chat
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/api/chat` | Recent chat history from `chat_messages` (so the panel survives a page refresh) |
 | POST | `/api/chat` | Send a message, receive complete JSON response (message + executed actions) |
 
 ### System
@@ -281,9 +282,9 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 
 ## 9. LLM Integration
 
-When writing code to make calls to LLMs, use cerebras-inference skill to use LiteLLM via OpenRouter to the `openrouter/openai/gpt-oss-120b` model with Cerebras as the inference provider. Structured Outputs should be used to interpret the results.
+When writing code to make calls to LLMs, call the OpenAI API directly (the official `openai` Python SDK) using the `gpt-4.1-mini` model. Use OpenAI's Structured Outputs (a Pydantic model passed as `response_format`) to get back parsed, schema-valid JSON — no separate parsing/validation step needed.
 
-There is an OPENROUTER_API_KEY in the .env file in the project root.
+There is an `OPENAI_API_KEY` in the `.env` file in the project root.
 
 ### How It Works
 
@@ -292,11 +293,11 @@ When the user sends a chat message, the backend:
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
 2. Loads recent conversation history from the `chat_messages` table
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
-4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
+4. Calls the OpenAI API with Structured Outputs, requesting a response matching the schema below
 5. Parses the complete structured JSON response
 6. Auto-executes any trades or watchlist changes specified in the response
 7. Stores the message and executed actions in `chat_messages`
-8. Returns the complete JSON response to the frontend (no token-by-token streaming — Cerebras inference is fast enough that a loading indicator is sufficient)
+8. Returns the complete JSON response to the frontend (no token-by-token streaming — the request is fast enough that a loading indicator is sufficient)
 
 ### Structured Output Schema
 
@@ -339,7 +340,7 @@ The LLM should be prompted as "FinAlly, an AI trading assistant" with instructio
 
 ### LLM Mock Mode
 
-When `LLM_MOCK=true`, the backend returns deterministic mock responses instead of calling OpenRouter. This enables:
+When `LLM_MOCK=true`, the backend returns deterministic mock responses instead of calling OpenAI. This enables:
 - Fast, free, reproducible E2E tests
 - Development without an API key
 - CI/CD pipelines
@@ -350,15 +351,21 @@ When `LLM_MOCK=true`, the backend returns deterministic mock responses instead o
 
 ### Layout
 
-The frontend is a single-page application with a dense, terminal-inspired layout. The specific component architecture and layout system is up to the Frontend Engineer, but the UI should include these elements:
+The frontend is a single-page application with a dense, terminal-inspired layout. The specific component architecture and layout system is up to the Frontend Engineer, but the UI should include these elements.
 
-- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change %, and a sparkline mini-chart (accumulated from SSE since page load)
+Build in this order — get the core loop solid first, then layer on the rest:
+
+1. Watchlist panel, main chart, positions table, trade bar, header (the core loop: watch prices, trade, see the result)
+2. P&L chart and AI chat panel
+3. Portfolio heatmap (stretch goal — the most complex visualization; ship after everything above works)
+
+- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change %, and a sparkline mini-chart (accumulated from SSE since page load). A ticker with no price yet (just added, not yet seeded/polled) shows a neutral "no data" placeholder instead of a blank or stale cell.
 - **Main chart area** — larger chart for the currently selected ticker, with at minimum price over time. Clicking a ticker in the watchlist selects it here.
-- **Portfolio heatmap** — treemap visualization where each rectangle is a position, sized by portfolio weight, colored by P&L (green = profit, red = loss)
+- **Portfolio heatmap** *(stretch goal)* — treemap visualization where each rectangle is a position, sized by portfolio weight, colored by P&L (green = profit, red = loss)
 - **P&L chart** — line chart showing total portfolio value over time, using data from `portfolio_snapshots`
 - **Positions table** — tabular view of all positions: ticker, quantity, avg cost, current price, unrealized P&L, % change
 - **Trade bar** — simple input area: ticker field, quantity field, buy button, sell button. Market orders, instant fill.
-- **AI chat panel** — docked/collapsible sidebar. Message input, scrolling conversation history, loading indicator while waiting for LLM response. Trade executions and watchlist changes shown inline as confirmations.
+- **AI chat panel** — docked sidebar, always visible (no open/closed state to build for v1). Message input, scrolling conversation history (loaded from `GET /api/chat` on page load), loading indicator while waiting for LLM response. Trade executions and watchlist changes shown inline as confirmations.
 - **Header** — portfolio total value (updating live), connection status indicator, cash balance
 
 ### Technical Notes
@@ -442,7 +449,7 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 
 ### E2E Tests (in `test/`)
 
-**Infrastructure**: A separate `docker-compose.test.yml` in `test/` that spins up the app container plus a Playwright container. This keeps browser dependencies out of the production image.
+**Infrastructure**: A separate `docker-compose.test.yml` in `test/` that spins up the app container plus a Playwright container — used for CI and pre-merge confidence, keeping browser dependencies out of the production image. While actively writing tests, it's fine to run Playwright directly against a locally started backend/frontend dev server for a faster iteration loop; the Docker Compose stack is what CI runs.
 
 **Environment**: Tests run with `LLM_MOCK=true` by default for speed and determinism.
 
@@ -454,3 +461,24 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Open Questions, Clarifications & Simplification Notes
+
+*From a documentation review pass. Resolved items were incorporated directly into the relevant sections above; this log records what changed and why, plus anything still open.*
+
+### Resolved
+
+- **LLM provider: OpenAI, not OpenRouter/Cerebras.** Confirmed decision — this project uses OpenAI directly throughout, not the OpenRouter/Cerebras path from the original draft. Sections 3, 5, and 9 now specify `OPENAI_API_KEY` and the OpenAI SDK. Model: `gpt-4.1-mini`. Response mode: kept non-streaming (single JSON response + loading indicator) for simplicity, per Section 9 step 8 — note the original rationale for non-streaming was Cerebras's speed, which no longer applies, but a plain `gpt-4.1-mini` structured-output call is still fast enough that this shouldn't be a noticeable regression.
+- **Chat history retrieval** — added `GET /api/chat` (Section 8) so the panel can hydrate from `chat_messages` on page load instead of being session-only.
+- **Avg-cost methodology** — spelled out in Section 7 (weighted average cost basis on buys, unchanged on sells).
+- **Fractional share / price precision** — spelled out in Section 7 (quantity to 6 decimals, price to 2).
+- **Wording nit** — Section 4's `backend/db/` comment no longer says "migration logic" (was in tension with Section 7's "no separate migration step").
+- **Heatmap scope** — marked a stretch goal in Section 10, with an explicit build order so the core trading loop ships first.
+- **Collapsible chat sidebar** — simplified to always-visible in Section 10; no open/closed state to build for v1.
+- **E2E test infra** — Section 12 now explicitly allows running Playwright against a local dev server while authoring tests, reserving the full `docker-compose.test.yml` stack for CI.
+
+### Still Open
+
+- **Unknown/delisted tickers on the Massive (real-data) path.** Section 10 now specifies a "no data" placeholder for a watchlist ticker with no price yet, which covers the common case (freshly added, not yet polled). Whether an *invalid* ticker (one Massive will never return data for) needs a distinct error/removal affordance, versus just sitting in "no data" forever, is still an open UX call — low priority since the simulator (the default, no-API-key path) doesn't have this problem at all.
